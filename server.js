@@ -41,7 +41,7 @@ const REDIS_URL     = process.env.REDIS_URL   || null;   // ej: redis://localhos
 const CACHE_TTL_MS  = 8 * 60 * 1000;   // 8 min (tokens de Rumble duran ~10-15 min)
 const BROWSER_LIMIT = parseInt(process.env.BROWSER_LIMIT) || 3; // por worker
 const WORKERS       = parseInt(process.env.WEB_CONCURRENCY) || Math.min(os.cpus().length, 2);
-const JOB_TIMEOUT   = 30_000;          // 30s por job
+const JOB_TIMEOUT   = 70_000;          // 70s por job (55s extractor + margen)
 const JOB_CONCURRENCY = BROWSER_LIMIT; // jobs paralelos por worker
 
 // ─── Redis / caché en memoria como fallback ──────────────────────────────────
@@ -85,57 +85,118 @@ async function extractM3U8(embedUrl) {
       '--no-sandbox', '--disable-setuid-sandbox',
       '--disable-dev-shm-usage', '--disable-gpu',
       '--disable-extensions', '--mute-audio',
-      '--disable-background-networking',
+      '--autoplay-policy=no-user-gesture-required', // permite autoplay
     ],
   });
 
   try {
-    const ctx  = await browser.newContext({
+    const ctx = await browser.newContext({
       userAgent:
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
         'AppleWebKit/537.36 (KHTML, like Gecko) ' +
         'Chrome/124.0.0.0 Safari/537.36',
-      // Bloquea recursos innecesarios para mayor velocidad
       serviceWorkers: 'block',
+      // Permisos necesarios para que el player arranque
+      permissions: ['autoplay'],
     });
 
-    // Bloquea imágenes, fuentes y CSS para cargar más rápido
+    // Solo bloquea imágenes y fuentes — NO bloquea media ni scripts
+    // porque el player necesita sus JS para generar la URL del stream
     await ctx.route('**/*', (route) => {
       const type = route.request().resourceType();
-      if (['image', 'font', 'stylesheet', 'media'].includes(type)) {
-        return route.abort();
-      }
+      if (['image', 'font'].includes(type)) return route.abort();
       return route.continue();
     });
 
     const page = await ctx.newPage();
 
-    const m3u8Url = await new Promise((resolve, reject) => {
+    // ── Promesa que se resuelve cuando detectamos el .m3u8 ──────────────────
+    let resolved = false;
+    const m3u8Promise = new Promise((resolve, reject) => {
       const timer = setTimeout(
-        () => reject(new Error('Timeout: no se encontró .m3u8 en 25s')),
-        25_000
+        () => reject(new Error('Timeout: no se encontró .m3u8 en 55s')),
+        55_000
       );
 
       const found = (url) => {
+        if (resolved) return;
         if (url.includes('.m3u8')) {
+          resolved = true;
           clearTimeout(timer);
           resolve(url);
         }
       };
 
-      // Intercepta peticiones salientes
       page.on('request',  req  => found(req.url()));
-      // Y también respuestas (cubre XHR/fetch con redirect)
       page.on('response', resp => found(resp.url()));
     });
 
-    // Navega (no esperamos a full load, solo domcontentloaded)
-    page.goto(embedUrl, { waitUntil: 'domcontentloaded', timeout: 20_000 })
-        .catch(() => {}); // ignoramos errores de navegación; el evento ya resolvió
+    // ── 1. Navega al embed y espera a que el DOM esté listo ─────────────────
+    console.log(`[BROWSER] Navegando a: ${embedUrl}`);
+    await page.goto(embedUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 })
+              .catch(() => {});
 
-    const result = await m3u8Url;    // ya resuelta por el listener
+    // ── 2. Espera un momento a que el player JS inicialice ──────────────────
+    await page.waitForTimeout(2000);
+
+    // ── 3. Intenta clicks en el orden más común de players de video ─────────
+    // Lista de selectores típicos de botones de play en players embebidos
+    const playSelectors = [
+      // Genéricos
+      'button[class*="play"]',
+      'div[class*="play"]',
+      '[class*="play-btn"]',
+      '[class*="playbtn"]',
+      '[class*="play_btn"]',
+      '[id*="play"]',
+      // JWPlayer
+      '.jw-icon-display',
+      '.jw-display-icon-container',
+      // VideoJS
+      '.vjs-big-play-button',
+      // Plyr
+      '.plyr__control--overlaid',
+      // HTML5 nativo
+      'video',
+      // Overlay de click general (muchos players usan un div encima del video)
+      '[class*="overlay"]',
+      '[class*="poster"]',
+      '[class*="thumbnail"]',
+      // Iframes anidados: intenta también dentro del primer iframe
+    ];
+
+    let clicked = false;
+    for (const selector of playSelectors) {
+      try {
+        const el = await page.$(selector);
+        if (el) {
+          await el.click({ timeout: 2000 }).catch(() => {});
+          console.log(`[CLICK] Selector: ${selector}`);
+          clicked = true;
+          break;
+        }
+      } catch (_) {}
+    }
+
+    // ── 4. Si ningún selector funcionó, intenta click en el centro de la página
+    //       (muchos players de embed detectan cualquier click para iniciar)
+    if (!clicked) {
+      console.log('[CLICK] Fallback: click en el centro de la página');
+      await page.mouse.click(640, 360).catch(() => {});
+    }
+
+    // ── 5. Si hay un <video> en la página, fuerza play por JS ───────────────
+    await page.evaluate(() => {
+      const videos = document.querySelectorAll('video');
+      videos.forEach(v => { try { v.play(); } catch(_) {} });
+      // Algunos players escuchan eventos de click en el documento
+      document.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    }).catch(() => {});
+
+    // ── 6. Espera a que el .m3u8 aparezca en el tráfico de red ──────────────
+    const result = await m3u8Promise;
     await cacheSet(embedUrl, result);
-    console.log(`[FOUND] ${result.slice(0, 80)}…`);
+    console.log(`[FOUND] ${result.slice(0, 100)}…`);
     return result;
 
   } finally {
