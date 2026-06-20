@@ -198,6 +198,7 @@ async function getStream(url) {
 const app = express();
 app.use(cors({ origin: '*' }));
 
+// ── /get-stream — extrae el m3u8 y devuelve la URL del proxy ─────────────────
 app.get('/get-stream', async (req, res) => {
   const embedUrl = req.query.url;
   if (!embedUrl) return res.status(400).json({ success: false, error: 'Falta parámetro url' });
@@ -205,10 +206,71 @@ app.get('/get-stream', async (req, res) => {
 
   try {
     const m3u8 = await getStream(embedUrl);
-    res.json({ success: true, m3u8 });
+
+    // En lugar de devolver la URL directa del CDN (que está atada a la IP de Render),
+    // devolvemos una URL de nuestro propio proxy para que el navegador del usuario
+    // pida el stream a través del servidor, manteniendo siempre la IP de Render.
+    const proxyUrl = `/proxy-stream?url=${encodeURIComponent(m3u8)}`;
+    res.json({ success: true, m3u8: proxyUrl });
   } catch (err) {
     console.error(`[ERROR] ${err.message}`);
     res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── /proxy-stream — hace de intermediario entre el usuario y el CDN ───────────
+// El navegador pide los segmentos a este endpoint.
+// El servidor los descarga del CDN (con la IP de Render) y los reenvía.
+app.get('/proxy-stream', async (req, res) => {
+  const targetUrl = req.query.url;
+  if (!targetUrl) return res.status(400).send('Falta url');
+
+  try {
+    const upstream = await fetch(targetUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Referer':    'https://vimeos.net/',
+        'Origin':     'https://vimeos.net',
+      },
+    });
+
+    if (!upstream.ok) {
+      return res.status(upstream.status).send('Error del CDN: ' + upstream.status);
+    }
+
+    // Reenvía los headers de contenido relevantes
+    const contentType = upstream.headers.get('content-type') || 'application/octet-stream';
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
+    // Si es un archivo .m3u8 (playlist), reescribe las URLs internas
+    // para que también pasen por el proxy
+    if (targetUrl.includes('.m3u8') || contentType.includes('mpegurl')) {
+      let text = await upstream.text();
+
+      // La base URL del m3u8 (para resolver rutas relativas)
+      const base = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
+
+      // Reescribe cada línea que sea una URL de segmento o sub-playlist
+      text = text.split('\n').map(line => {
+        line = line.trim();
+        if (!line || line.startsWith('#')) return line;
+
+        // Construye la URL absoluta del segmento
+        const absUrl = line.startsWith('http') ? line : base + line;
+        return `/proxy-stream?url=${encodeURIComponent(absUrl)}`;
+      }).join('\n');
+
+      return res.send(text);
+    }
+
+    // Para segmentos .ts y otros binarios: stream directo
+    const buffer = await upstream.arrayBuffer();
+    res.send(Buffer.from(buffer));
+
+  } catch (err) {
+    console.error(`[PROXY ERROR] ${err.message}`);
+    res.status(500).send('Error de proxy: ' + err.message);
   }
 });
 
