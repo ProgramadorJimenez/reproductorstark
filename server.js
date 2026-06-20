@@ -39,7 +39,6 @@ function releaseSlot() {
   else activeCount--;
 }
 
-// ── Extractor: devuelve { m3u8, headers } ────────────────────────────────────
 async function extractM3U8(embedUrl) {
   await acquireSlot();
   console.log(`[BROWSER] Abriendo (activos: ${activeCount}): ${embedUrl}`);
@@ -70,9 +69,9 @@ async function extractM3U8(embedUrl) {
 
     const page = await ctx.newPage();
 
-    // Captura la URL del m3u8 Y los headers exactos que usó el player
+    // ── Configura el listener ANTES de navegar ────────────────────────────
     let resolved = false;
-    const result = await new Promise((resolve, reject) => {
+    const m3u8Promise = new Promise((resolve, reject) => {
       const timer = setTimeout(
         () => reject(new Error('Timeout: no se encontró .m3u8 en 55s')),
         55_000
@@ -84,44 +83,71 @@ async function extractM3U8(embedUrl) {
         if (url.includes('.m3u8')) {
           resolved = true;
           clearTimeout(timer);
-          // Captura los headers que el player usó para pedir el m3u8
-          const reqHeaders = req.headers();
-          resolve({ m3u8: url, reqHeaders });
+          resolve({ m3u8: url, headers: req.headers() });
+        }
+      });
+
+      page.on('response', resp => {
+        if (resolved) return;
+        const url = resp.url();
+        if (url.includes('.m3u8')) {
+          resolved = true;
+          clearTimeout(timer);
+          resolve({ m3u8: url, headers: {} });
         }
       });
     });
 
-    // Navega y simula play
-    await page.goto(embedUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {});
+    // ── 1. Navega al embed ───────────────────────────────────────────────
+    console.log('[NAV] Cargando embed...');
+    await page.goto(embedUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 })
+              .catch(() => {});
+
+    // ── 2. Espera a que el player JS cargue ─────────────────────────────
     await page.waitForTimeout(2500);
 
+    // ── 3. Simula click en play ──────────────────────────────────────────
     const playSelectors = [
       'button[class*="play"]', 'div[class*="play"]', '[class*="play-btn"]',
       '[class*="playbtn"]', '[id*="play"]', '.jw-icon-display',
       '.jw-display-icon-container', '.vjs-big-play-button',
       '.plyr__control--overlaid', '[class*="overlay"]', '[class*="poster"]', 'video',
     ];
+
     let clicked = false;
     for (const sel of playSelectors) {
       try {
         const el = await page.$(sel);
-        if (el) { await el.click({ timeout: 2000 }).catch(() => {}); clicked = true; break; }
+        if (el) {
+          await el.click({ timeout: 2000 }).catch(() => {});
+          console.log(`[CLICK] ${sel}`);
+          clicked = true;
+          break;
+        }
       } catch (_) {}
     }
-    if (!clicked) await page.mouse.click(640, 360).catch(() => {});
+
+    if (!clicked) {
+      console.log('[CLICK] Fallback centro');
+      await page.mouse.click(640, 360).catch(() => {});
+    }
+
+    // ── 4. Fuerza play por JS ────────────────────────────────────────────
     await page.evaluate(() => {
       document.querySelectorAll('video').forEach(v => { try { v.play(); } catch(_){} });
       document.dispatchEvent(new MouseEvent('click', { bubbles: true }));
     }).catch(() => {});
 
-    const final = await result;
+    // ── 5. Espera el .m3u8 ──────────────────────────────────────────────
+    const found = await m3u8Promise;
+    console.log(`[FOUND] ${found.m3u8.slice(0, 100)}`);
 
-    // Obtiene las cookies del contexto para pasarlas al proxy
-    const cookies = await ctx.cookies();
+    // ── 6. Captura cookies del contexto ─────────────────────────────────
+    const cookies  = await ctx.cookies();
     const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
 
     return {
-      m3u8:      final.m3u8,
+      m3u8:      found.m3u8,
       referer:   embedUrl,
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       cookie:    cookieStr,
@@ -148,7 +174,6 @@ async function getStream(url) {
 const app = express();
 app.use(cors({ origin: '*' }));
 
-// ── /get-stream — extrae m3u8 y devuelve URL del proxy con token ──────────────
 app.get('/get-stream', async (req, res) => {
   const embedUrl = req.query.url;
   if (!embedUrl) return res.status(400).json({ success: false, error: 'Falta url' });
@@ -158,7 +183,6 @@ app.get('/get-stream', async (req, res) => {
     const data = await getStream(embedUrl);
     cacheSet(embedUrl, data);
 
-    // Codifica los datos del stream en base64 para pasarlos como token al proxy
     const token = Buffer.from(JSON.stringify({
       m3u8:      data.m3u8,
       referer:   data.referer,
@@ -174,15 +198,13 @@ app.get('/get-stream', async (req, res) => {
   }
 });
 
-// ── /proxy-stream — proxy que usa los headers/cookies exactos del browser ─────
 app.get('/proxy-stream', async (req, res) => {
   const token     = req.query.t;
-  const targetUrl = req.query.url; // para segmentos internos reescritos
+  const targetUrl = req.query.url;
 
   let m3u8, referer, userAgent, cookie, origin, base;
 
   if (token) {
-    // Primera petición: decodifica el token con todos los datos
     try {
       const data = JSON.parse(Buffer.from(token, 'base64url').toString());
       m3u8      = data.m3u8;
@@ -195,7 +217,6 @@ app.get('/proxy-stream', async (req, res) => {
       return res.status(400).send('Token inválido');
     }
   } else if (targetUrl) {
-    // Segmentos internos: los parámetros vienen en query string
     m3u8      = targetUrl;
     referer   = req.query.referer   || '';
     userAgent = req.query.ua        || '';
@@ -226,14 +247,11 @@ app.get('/proxy-stream', async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Cache-Control', 'no-cache');
 
-    // Si es un m3u8, reescribe las URLs internas para que también pasen por el proxy
     if (m3u8.includes('.m3u8') || contentType.includes('mpegurl')) {
       let text = await upstream.text();
-      console.log(`[PROXY] m3u8 obtenido (${text.length} bytes)`);
+      console.log(`[PROXY] m3u8 OK (${text.length} bytes)`);
 
-      const params = new URLSearchParams({
-        referer, ua: userAgent, cookie, origin
-      });
+      const params = new URLSearchParams({ referer, ua: userAgent, cookie, origin });
 
       text = text.split('\n').map(line => {
         const trimmed = line.trim();
@@ -245,7 +263,6 @@ app.get('/proxy-stream', async (req, res) => {
       return res.send(text);
     }
 
-    // Segmentos .ts — stream binario directo
     const buffer = await upstream.arrayBuffer();
     res.send(Buffer.from(buffer));
 
