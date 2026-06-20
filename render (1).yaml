@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: reproductorstark
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    envVars:
+      - key: PORT
+        value: 3000
+      - key: BROWSER_LIMIT
+        value: 2
