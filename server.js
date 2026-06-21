@@ -191,7 +191,9 @@ app.get('/get-stream', async (req, res) => {
       origin:    data.origin,
     })).toString('base64url');
 
-    res.json({ success: true, m3u8: `/proxy-stream?t=${token}` });
+    // Redirige el proxy al Worker de Cloudflare (no a Render)
+    const WORKER_URL = process.env.WORKER_URL || 'https://proxy-video-stark.starkappservice.workers.dev';
+    res.json({ success: true, m3u8: `${WORKER_URL}/proxy-stream?t=${token}` });
   } catch (err) {
     console.error(`[ERROR] ${err.message}`);
     res.status(500).json({ success: false, error: err.message });
