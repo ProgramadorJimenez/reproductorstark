@@ -5,7 +5,7 @@ const cors         = require('cors');
 const { chromium } = require('playwright');
 
 const PORT         = process.env.PORT || 3000;
-const CACHE_TTL_MS = 8 * 60 * 1000;
+const CACHE_TTL_MS = 3 * 60 * 1000; // 3 min — tokens de tiktokshopping expiran rápido
 
 const memCache = new Map();
 function cacheGet(key) {
@@ -178,6 +178,12 @@ app.get('/get-stream', async (req, res) => {
   const embedUrl = req.query.url;
   if (!embedUrl) return res.status(400).json({ success: false, error: 'Falta url' });
   try { new URL(embedUrl); } catch { return res.status(400).json({ success: false, error: 'URL inválida' }); }
+
+  // ?nocache=1 fuerza nueva extracción ignorando el caché
+  if (req.query.nocache) {
+    memCache.delete(embedUrl);
+    console.log(`[NOCACHE] Limpiando caché para: ${embedUrl}`);
+  }
 
   try {
     const data = await getStream(embedUrl);
