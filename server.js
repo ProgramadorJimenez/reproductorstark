@@ -5,7 +5,7 @@ const cors         = require('cors');
 const { chromium } = require('playwright');
 
 const PORT         = process.env.PORT || 3000;
-const CACHE_TTL_MS = 8 * 60 * 1000; // 8 minutos
+const CACHE_TTL_MS = 4 * 60 * 60 * 1000; // 4 horas
 
 const memCache = new Map();
 function cacheGet(key) {
