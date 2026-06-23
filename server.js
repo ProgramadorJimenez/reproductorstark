@@ -285,6 +285,16 @@ app.get('/proxy-stream', async (req, res) => {
       console.log(`[PROXY] HLS OK (${text.length} bytes)`);
 
       const params = new URLSearchParams({ referer, ua: userAgent, cookie, origin });
+      // Función para resolver URLs relativas correctamente
+      function resolveUrl(uri) {
+        if (uri.startsWith('http')) return uri;
+        if (uri.startsWith('/')) {
+          const o = new URL(streamUrl);
+          return o.origin + uri;
+        }
+        return base + uri;
+      }
+
       text = text.split('\n').map(line => {
         const trimmed = line.trim();
         if (!trimmed) return line;
@@ -292,13 +302,13 @@ app.get('/proxy-stream', async (req, res) => {
         // Reescribir URIs dentro de líneas #EXT-X-... (como URI="iframes.txt")
         if (trimmed.startsWith('#')) {
           return line.replace(/URI="([^"]+)"/g, function(match, uri) {
-            const absUrl = uri.startsWith('http') ? uri : base + uri;
+            const absUrl = resolveUrl(uri);
             return `URI="/proxy-stream?url=${encodeURIComponent(absUrl)}&${params.toString()}"`;
           });
         }
 
         // Reescribir líneas normales (segmentos)
-        const absUrl = trimmed.startsWith('http') ? trimmed : base + trimmed;
+        const absUrl = resolveUrl(trimmed);
         return `/proxy-stream?url=${encodeURIComponent(absUrl)}&${params.toString()}`;
       }).join('\n');
 
