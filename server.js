@@ -20,7 +20,7 @@ function cacheSet(key, val) {
 
 const inFlight = new Map();
 let activeCount = 0;
-const MAX_CONCURRENT = parseInt(process.env.BROWSER_LIMIT) || 2;
+const MAX_CONCURRENT = parseInt(process.env.BROWSER_LIMIT) || 15;
 const waitQueue = [];
 
 function acquireSlot() {
@@ -39,7 +39,24 @@ function releaseSlot() {
   else activeCount--;
 }
 
-async function extractM3U8(embedUrl) {
+// Detecta si una URL es un stream de video válido
+function isVideoUrl(url) {
+  const u = url.toLowerCase().split('?')[0];
+  return u.includes('.m3u8') || u.includes('.mp4') || u.includes('.mkv') ||
+         u.includes('.webm') || u.includes('.avi') || u.includes('.mov');
+}
+
+// Devuelve el tipo de stream
+function getStreamType(url) {
+  const u = url.toLowerCase().split('?')[0];
+  if (u.includes('.m3u8')) return 'hls';
+  if (u.includes('.mp4'))  return 'mp4';
+  if (u.includes('.mkv'))  return 'mp4'; // JWPlayer lee mkv como mp4
+  if (u.includes('.webm')) return 'mp4';
+  return 'mp4';
+}
+
+async function extractStream(embedUrl) {
   await acquireSlot();
   console.log(`[BROWSER] Abriendo (activos: ${activeCount}): ${embedUrl}`);
 
@@ -69,44 +86,35 @@ async function extractM3U8(embedUrl) {
 
     const page = await ctx.newPage();
 
-    // ── Configura el listener ANTES de navegar ────────────────────────────
+    // ── Listener ANTES de navegar ─────────────────────────────────────────
     let resolved = false;
-    const m3u8Promise = new Promise((resolve, reject) => {
+    const streamPromise = new Promise((resolve, reject) => {
       const timer = setTimeout(
-        () => reject(new Error('Timeout: no se encontró .m3u8 en 55s')),
+        () => reject(new Error('Timeout: no se encontró stream en 55s')),
         55_000
       );
 
-      page.on('request', req => {
+      const found = (url, headers) => {
         if (resolved) return;
-        const url = req.url();
-        if (url.includes('.m3u8')) {
+        if (isVideoUrl(url)) {
           resolved = true;
           clearTimeout(timer);
-          resolve({ m3u8: url, headers: req.headers() });
+          resolve({ url, headers: headers || {} });
         }
-      });
+      };
 
-      page.on('response', resp => {
-        if (resolved) return;
-        const url = resp.url();
-        if (url.includes('.m3u8')) {
-          resolved = true;
-          clearTimeout(timer);
-          resolve({ m3u8: url, headers: {} });
-        }
-      });
+      page.on('request',  req  => found(req.url(), req.headers()));
+      page.on('response', resp => found(resp.url(), {}));
     });
 
-    // ── 1. Navega al embed ───────────────────────────────────────────────
+    // ── Navega al embed ───────────────────────────────────────────────────
     console.log('[NAV] Cargando embed...');
     await page.goto(embedUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 })
               .catch(() => {});
 
-    // ── 2. Espera a que el player JS cargue ─────────────────────────────
     await page.waitForTimeout(2500);
 
-    // ── 3. Simula click en play ──────────────────────────────────────────
+    // ── Simula click en play ──────────────────────────────────────────────
     const playSelectors = [
       'button[class*="play"]', 'div[class*="play"]', '[class*="play-btn"]',
       '[class*="playbtn"]', '[id*="play"]', '.jw-icon-display',
@@ -132,22 +140,22 @@ async function extractM3U8(embedUrl) {
       await page.mouse.click(640, 360).catch(() => {});
     }
 
-    // ── 4. Fuerza play por JS ────────────────────────────────────────────
     await page.evaluate(() => {
       document.querySelectorAll('video').forEach(v => { try { v.play(); } catch(_){} });
       document.dispatchEvent(new MouseEvent('click', { bubbles: true }));
     }).catch(() => {});
 
-    // ── 5. Espera el .m3u8 ──────────────────────────────────────────────
-    const found = await m3u8Promise;
-    console.log(`[FOUND] ${found.m3u8.slice(0, 100)}`);
+    // ── Espera el stream ──────────────────────────────────────────────────
+    const found = await streamPromise;
+    const tipo  = getStreamType(found.url);
+    console.log(`[FOUND] ${tipo.toUpperCase()} → ${found.url.slice(0, 100)}`);
 
-    // ── 6. Captura cookies del contexto ─────────────────────────────────
-    const cookies  = await ctx.cookies();
+    const cookies   = await ctx.cookies();
     const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
 
     return {
-      m3u8:      found.m3u8,
+      url:       found.url,
+      type:      tipo,
       referer:   embedUrl,
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       cookie:    cookieStr,
@@ -165,7 +173,7 @@ async function getStream(url) {
   const cached = cacheGet(url);
   if (cached) { console.log(`[CACHE HIT] ${url}`); return cached; }
   if (inFlight.has(url)) { console.log(`[DEDUP] ${url}`); return inFlight.get(url); }
-  const promise = extractM3U8(url);
+  const promise = extractStream(url);
   inFlight.set(url, promise);
   promise.finally(() => inFlight.delete(url));
   return promise;
@@ -174,15 +182,15 @@ async function getStream(url) {
 const app = express();
 app.use(cors({ origin: '*' }));
 
+// ── /get-stream ───────────────────────────────────────────────────────────────
 app.get('/get-stream', async (req, res) => {
   const embedUrl = req.query.url;
   if (!embedUrl) return res.status(400).json({ success: false, error: 'Falta url' });
   try { new URL(embedUrl); } catch { return res.status(400).json({ success: false, error: 'URL inválida' }); }
 
-  // ?nocache=1 fuerza nueva extracción ignorando el caché
   if (req.query.nocache) {
     memCache.delete(embedUrl);
-    console.log(`[NOCACHE] Limpiando caché para: ${embedUrl}`);
+    console.log(`[NOCACHE] ${embedUrl}`);
   }
 
   try {
@@ -190,51 +198,59 @@ app.get('/get-stream', async (req, res) => {
     cacheSet(embedUrl, data);
 
     const token = Buffer.from(JSON.stringify({
-      m3u8:      data.m3u8,
+      url:       data.url,
+      type:      data.type,
       referer:   data.referer,
       userAgent: data.userAgent,
       cookie:    data.cookie,
       origin:    data.origin,
     })).toString('base64url');
 
-    res.json({ success: true, m3u8: `/proxy-stream?t=${token}` });
+    res.json({
+      success: true,
+      m3u8:    `/proxy-stream?t=${token}`,
+      type:    data.type,
+    });
   } catch (err) {
     console.error(`[ERROR] ${err.message}`);
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
+// ── /proxy-stream ─────────────────────────────────────────────────────────────
 app.get('/proxy-stream', async (req, res) => {
   const token     = req.query.t;
   const targetUrl = req.query.url;
 
-  let m3u8, referer, userAgent, cookie, origin, base;
+  let streamUrl, referer, userAgent, cookie, origin, base, tipo;
 
   if (token) {
     try {
       const data = JSON.parse(Buffer.from(token, 'base64url').toString());
-      m3u8      = data.m3u8;
+      streamUrl = data.url;
+      tipo      = data.type;
       referer   = data.referer;
       userAgent = data.userAgent;
       cookie    = data.cookie;
       origin    = data.origin;
-      base      = m3u8.substring(0, m3u8.lastIndexOf('/') + 1);
+      base      = streamUrl.substring(0, streamUrl.lastIndexOf('/') + 1);
     } catch {
       return res.status(400).send('Token inválido');
     }
   } else if (targetUrl) {
-    m3u8      = targetUrl;
-    referer   = req.query.referer   || '';
-    userAgent = req.query.ua        || '';
-    cookie    = req.query.cookie    || '';
-    origin    = req.query.origin    || '';
+    streamUrl = targetUrl;
+    tipo      = getStreamType(targetUrl);
+    referer   = req.query.referer || '';
+    userAgent = req.query.ua      || '';
+    cookie    = req.query.cookie  || '';
+    origin    = req.query.origin  || '';
     base      = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
   } else {
     return res.status(400).send('Falta t o url');
   }
 
   try {
-    const upstream = await fetch(m3u8, {
+    const upstream = await fetch(streamUrl, {
       headers: {
         'User-Agent': userAgent,
         'Referer':    referer,
@@ -244,21 +260,25 @@ app.get('/proxy-stream', async (req, res) => {
     });
 
     if (!upstream.ok) {
-      console.error(`[PROXY] ${upstream.status} para ${m3u8}`);
+      console.error(`[PROXY] ${upstream.status} para ${streamUrl}`);
       return res.status(upstream.status).send('CDN devolvió ' + upstream.status);
     }
 
     const contentType = upstream.headers.get('content-type') || 'application/octet-stream';
-    res.setHeader('Content-Type', contentType);
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Cache-Control', 'no-cache');
 
-    if (m3u8.includes('.m3u8') || contentType.includes('mpegurl')) {
+    // Si es HLS reescribe las URLs internas
+    const isHLS = streamUrl.includes('.m3u8') ||
+                  contentType.includes('mpegurl') ||
+                  contentType.includes('x-mpegurl');
+
+    if (isHLS) {
+      res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
       let text = await upstream.text();
-      console.log(`[PROXY] m3u8 OK (${text.length} bytes)`);
+      console.log(`[PROXY] HLS OK (${text.length} bytes)`);
 
       const params = new URLSearchParams({ referer, ua: userAgent, cookie, origin });
-
       text = text.split('\n').map(line => {
         const trimmed = line.trim();
         if (!trimmed || trimmed.startsWith('#')) return line;
@@ -268,6 +288,34 @@ app.get('/proxy-stream', async (req, res) => {
 
       return res.send(text);
     }
+
+    // Para MP4/MKV/otros — stream binario directo con soporte de Range
+    const rangeHeader = req.headers['range'];
+    if (rangeHeader) {
+      // Reenvía el header Range al CDN para permitir seek en MP4
+      const upstreamRange = await fetch(streamUrl, {
+        headers: {
+          'User-Agent': userAgent,
+          'Referer':    referer,
+          'Origin':     origin,
+          'Range':      rangeHeader,
+          ...(cookie ? { 'Cookie': cookie } : {}),
+        },
+      });
+      res.setHeader('Content-Type', upstreamRange.headers.get('content-type') || contentType);
+      res.setHeader('Content-Range',  upstreamRange.headers.get('content-range') || '');
+      res.setHeader('Accept-Ranges',  'bytes');
+      res.setHeader('Content-Length', upstreamRange.headers.get('content-length') || '');
+      res.status(upstreamRange.status);
+      const buf = await upstreamRange.arrayBuffer();
+      return res.send(Buffer.from(buf));
+    }
+
+    // Sin Range — stream completo
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Accept-Ranges', 'bytes');
+    const contentLength = upstream.headers.get('content-length');
+    if (contentLength) res.setHeader('Content-Length', contentLength);
 
     const buffer = await upstream.arrayBuffer();
     res.send(Buffer.from(buffer));
