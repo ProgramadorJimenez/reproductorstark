@@ -285,7 +285,17 @@ app.get('/proxy-stream', async (req, res) => {
       const params = new URLSearchParams({ referer, ua: userAgent, cookie, origin });
       text = text.split('\n').map(line => {
         const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith('#')) return line;
+        if (!trimmed) return line;
+
+        // Reescribir URIs dentro de líneas #EXT-X-... (como URI="iframes.txt")
+        if (trimmed.startsWith('#')) {
+          return line.replace(/URI="([^"]+)"/g, function(match, uri) {
+            const absUrl = uri.startsWith('http') ? uri : base + uri;
+            return `URI="/proxy-stream?url=${encodeURIComponent(absUrl)}&${params.toString()}"`;
+          });
+        }
+
+        // Reescribir líneas normales (segmentos)
         const absUrl = trimmed.startsWith('http') ? trimmed : base + trimmed;
         return `/proxy-stream?url=${encodeURIComponent(absUrl)}&${params.toString()}`;
       }).join('\n');
