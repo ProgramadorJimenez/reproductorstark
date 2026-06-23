@@ -43,13 +43,15 @@ function releaseSlot() {
 function isVideoUrl(url) {
   const u = url.toLowerCase().split('?')[0];
   return u.includes('.m3u8') || u.includes('.mp4') || u.includes('.mkv') ||
-         u.includes('.webm') || u.includes('.avi') || u.includes('.mov');
+         u.includes('.webm') || u.includes('.avi') || u.includes('.mov') ||
+         u.includes('.txt');  // algunos servidores disfrazan HLS como .txt
 }
 
 // Devuelve el tipo de stream
 function getStreamType(url) {
   const u = url.toLowerCase().split('?')[0];
   if (u.includes('.m3u8')) return 'hls';
+  if (u.includes('.txt'))  return 'hls'; // HLS disfrazado como .txt
   if (u.includes('.mp4'))  return 'mp4';
   if (u.includes('.mkv'))  return 'mp4'; // JWPlayer lee mkv como mp4
   if (u.includes('.webm')) return 'mp4';
@@ -270,8 +272,10 @@ app.get('/proxy-stream', async (req, res) => {
 
     // Si es HLS reescribe las URLs internas
     const isHLS = streamUrl.includes('.m3u8') ||
+                  streamUrl.includes('.txt') ||
                   contentType.includes('mpegurl') ||
-                  contentType.includes('x-mpegurl');
+                  contentType.includes('x-mpegurl') ||
+                  contentType.includes('text/plain'); // .txt disfrazado de HLS
 
     if (isHLS) {
       res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
