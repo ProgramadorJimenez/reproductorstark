@@ -278,7 +278,9 @@ app.get('/proxy-stream', async (req, res) => {
                   contentType.includes('text/plain'); // .txt disfrazado de HLS
 
     if (isHLS) {
+      // Forzar Content-Type HLS sin importar la extensión original (.txt, .m3u8, etc.)
       res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
       let text = await upstream.text();
       console.log(`[PROXY] HLS OK (${text.length} bytes)`);
 
